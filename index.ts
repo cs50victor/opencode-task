@@ -2,9 +2,71 @@ import { appendFile } from "node:fs/promises";
 import type { PluginInput } from "@opencode-ai/plugin";
 import { type Plugin, tool } from "@opencode-ai/plugin";
 
-// ============================================================================
-// Semaphore - Concurrency limiter with FIFO fairness
-// ============================================================================
+// NOTE(victor): Agent configs mirror Claude Code's Task tool agent types for CLI compatibility.
+export type AgentType =
+  | "Explore"
+  | "Plan"
+  | "general-purpose"
+  | "claude-code-guide";
+
+export interface AgentConfig {
+  description: string;
+  prompt: string;
+  tools: string[] | null;
+  model?: "sonnet" | "opus" | "haiku";
+}
+
+export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
+  Explore: {
+    description:
+      "Fast agent specialized for exploring codebases. Use when you need to quickly find files by patterns, search code for keywords, or answer questions about the codebase.",
+    prompt:
+      "You are an exploration specialist. Search thoroughly using Glob, Grep, and Read. Report findings concisely. Do not modify any files.",
+    tools: [
+      "Glob",
+      "Grep",
+      "Read",
+      "Bash",
+      "LSP",
+      "WebFetch",
+      "WebSearch",
+      "AskUserQuestion",
+    ],
+  },
+
+  Plan: {
+    description:
+      "Software architect agent for designing implementation plans. Use when you need to plan implementation strategy. Returns step-by-step plans, identifies critical files, considers architectural trade-offs.",
+    prompt:
+      "You are a software architect. Analyze requirements, explore the codebase thoroughly, and design clear implementation plans with specific steps. Do not modify any files.",
+    tools: [
+      "Glob",
+      "Grep",
+      "Read",
+      "Bash",
+      "LSP",
+      "WebFetch",
+      "WebSearch",
+      "AskUserQuestion",
+    ],
+  },
+
+  "general-purpose": {
+    description:
+      "General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. Use for heavy lifting when simpler agents are insufficient.",
+    prompt:
+      "You are a general-purpose assistant. Complete the assigned task thoroughly and report results.",
+    tools: null,
+  },
+
+  "claude-code-guide": {
+    description:
+      "Expert on Claude Code CLI features, hooks, slash commands, MCP servers, settings, IDE integrations. Also covers Claude Agent SDK and Claude API usage.",
+    prompt:
+      "You are a Claude Code expert. Answer questions about Claude Code features, Agent SDK, and API usage accurately. Search documentation and web resources as needed.",
+    tools: ["Glob", "Grep", "Read", "WebFetch", "WebSearch"],
+  },
+} as const;
 
 export class Semaphore {
   private permits: number;
@@ -59,10 +121,6 @@ export class Semaphore {
     return this.waiting.length;
   }
 }
-
-// ============================================================================
-// Task Types and Factory
-// ============================================================================
 
 export type TaskStatus =
   | "pending"
@@ -169,8 +227,6 @@ export class TaskRegistry {
       options.sessionID,
     );
     this.tasks.set(id, task);
-
-    // Execute in background - don't await
     this.executeTask(task);
     return id;
   }
@@ -201,8 +257,6 @@ export class TaskRegistry {
         });
 
         task.proc = proc;
-
-        // Wire AbortSignal to terminate subprocess
         task.abortController.signal.addEventListener("abort", () => {
           proc.kill();
         });
@@ -335,14 +389,10 @@ export class TaskRegistry {
   async shutdown(gracePeriodMs = 3000): Promise<void> {
     this.accepting = false;
     this.semaphore.drain();
-
-    // Cancel all eviction timers
     for (const timer of this.evictionTimers.values()) {
       clearTimeout(timer);
     }
     this.evictionTimers.clear();
-
-    // Send SIGTERM to running tasks
     const runningTasks: Task[] = [];
     for (const task of this.tasks.values()) {
       if (task.status === "running" && task.proc) {
@@ -367,7 +417,6 @@ export class TaskRegistry {
         } catch {}
       }
 
-      // Force kill if still running
       if (task.status === "running" && task.proc) {
         task.proc.kill(9);
       }
@@ -394,10 +443,6 @@ export class TaskRegistry {
     this.tasks.clear();
   }
 }
-
-// ============================================================================
-// Plugin Export
-// ============================================================================
 
 export const CustomToolPlugin: Plugin = async (input) => {
   // NOTE(victor): Registry created per-plugin with client for push notifications.
@@ -477,6 +522,68 @@ export const CustomToolPlugin: Plugin = async (input) => {
                   ? t.completedAt - t.startedAt
                   : undefined,
             })),
+          });
+        },
+      }),
+
+      AgentTask: tool({
+        description:
+          "Spawn a Claude agent to work on a subtask in the background. Available agents: Explore (codebase search), Plan (architecture design), general-purpose (complex multi-step tasks), claude-code-guide (Claude Code/SDK questions). You will receive a notification when complete.",
+        args: {
+          agent: tool.schema
+            .enum(["Explore", "Plan", "general-purpose", "claude-code-guide"])
+            .describe("Agent type to spawn"),
+          prompt: tool.schema.string().describe("Task prompt for the agent"),
+          cwd: tool.schema.string().optional().describe("Working directory"),
+          timeout: tool.schema
+            .number()
+            .optional()
+            .describe("Timeout in milliseconds"),
+        },
+        async execute(args, context) {
+          const agentType = args.agent as AgentType;
+          const config = AGENT_CONFIGS[agentType];
+          const agentDef = {
+            [agentType]: {
+              description: config.description,
+              prompt: config.prompt,
+            },
+          };
+
+          const cmdParts = [
+            "claude",
+            "--agents",
+            JSON.stringify(agentDef),
+            "--agent",
+            agentType,
+          ];
+
+          if (config.tools !== null) {
+            cmdParts.push("--tools", config.tools.join(","));
+          }
+
+          cmdParts.push(
+            "--output-format",
+            "stream-json",
+            "--print",
+            "-p",
+            args.prompt,
+          );
+
+          const command = cmdParts
+            .map((p) => (p.includes(" ") || p.includes('"') ? `'${p}'` : p))
+            .join(" ");
+
+          const id = await registry.spawn(command, {
+            cwd: args.cwd,
+            timeout: args.timeout,
+            sessionID: context.sessionID,
+          });
+
+          return JSON.stringify({
+            taskId: id,
+            agent: agentType,
+            message: `Agent ${agentType} spawned as ${id}. You will receive a notification when complete.`,
           });
         },
       }),

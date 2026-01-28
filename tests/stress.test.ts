@@ -14,9 +14,9 @@
  * - Pipe buffer deadlocks
  */
 
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { readdirSync } from "fs";
-import { TaskRegistry, Semaphore } from "../index";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
+import { Semaphore, TaskRegistry } from "../index";
 
 // ============================================================================
 // Test Utilities (from Bun's harness.ts patterns)
@@ -35,7 +35,7 @@ function getMaxFD(): number {
     const fdDir = isMacOS ? "/dev/fd" : "/proc/self/fd";
     try {
       for (const entry of readdirSync(fdDir)) {
-        const fd = parseInt(entry.trim(), 10);
+        const fd = Number.parseInt(entry.trim(), 10);
         if (Number.isSafeInteger(fd) && fd >= 0) {
           max = Math.max(max, fd);
         }
@@ -90,7 +90,9 @@ describe("Task Execution Stress Tests", () => {
   test("no file descriptor leaks under concurrent load", async () => {
     const initialFD = getMaxFD();
     if (initialFD < 0) {
-      console.log("Skipping FD test - cannot determine FD count on this platform");
+      console.log(
+        "Skipping FD test - cannot determine FD count on this platform",
+      );
       return;
     }
 
@@ -99,7 +101,7 @@ describe("Task Execution Stress Tests", () => {
 
     for (let batch = 0; batch < BATCHES; batch++) {
       const ids = await Promise.all(
-        Array.from({ length: BATCH_SIZE }, () => registry.spawn("echo hello"))
+        Array.from({ length: BATCH_SIZE }, () => registry.spawn("echo hello")),
       );
       await Promise.all(ids.map((id) => registry.wait(id)));
     }
@@ -126,7 +128,7 @@ describe("Task Execution Stress Tests", () => {
     for (let i = 0; i < ITERATIONS; i++) {
       // Generate large output to stress buffer accumulation
       const id = await registry.spawn(
-        `head -c ${OUTPUT_SIZE} /dev/urandom | base64`
+        `head -c ${OUTPUT_SIZE} /dev/urandom | base64`,
       );
       await registry.wait(id);
     }
@@ -154,8 +156,8 @@ describe("Task Execution Stress Tests", () => {
 
     const ids = await Promise.all(
       Array.from({ length: TOTAL_TASKS }, (_, i) =>
-        narrowRegistry.spawn(`echo task-${i} && sleep 0.01`)
-      )
+        narrowRegistry.spawn(`echo task-${i} && sleep 0.01`),
+      ),
     );
 
     // Wait for all to complete, track order
@@ -163,7 +165,7 @@ describe("Task Execution Stress Tests", () => {
       ids.map(async (id) => {
         await narrowRegistry.wait(id);
         completionOrder.push(id);
-      })
+      }),
     );
 
     // Verify all tasks completed
@@ -173,12 +175,14 @@ describe("Task Execution Stress Tests", () => {
     // Allow some reordering due to timing, but early tasks should finish early
     const firstHalf = completionOrder.slice(0, TOTAL_TASKS / 2);
     const earlyTasksInFirstHalf = firstHalf.filter((id) => {
-      const num = parseInt(id.split("-")[1]);
+      const num = Number.parseInt(id.split("-")[1]);
       return num < TOTAL_TASKS / 2;
     }).length;
 
     // At least 60% of first-half completions should be from early tasks
-    expect(earlyTasksInFirstHalf).toBeGreaterThanOrEqual((TOTAL_TASKS / 2) * 0.6);
+    expect(earlyTasksInFirstHalf).toBeGreaterThanOrEqual(
+      (TOTAL_TASKS / 2) * 0.6,
+    );
 
     narrowRegistry.clear();
   }, 60000);
@@ -193,12 +197,14 @@ describe("Task Execution Stress Tests", () => {
 
     const ids = await Promise.all(
       Array.from({ length: CONCURRENT }, (_, i) =>
-        registry.spawn(`echo "task ${i}" && sleep 0.05`)
-      )
+        registry.spawn(`echo "task ${i}" && sleep 0.05`),
+      ),
     );
 
     // All tasks should complete
-    const results = await Promise.all(ids.map((id) => registry.wait(id, 10000)));
+    const results = await Promise.all(
+      ids.map((id) => registry.wait(id, 10000)),
+    );
 
     const duration = Date.now() - startTime;
 
@@ -226,7 +232,7 @@ describe("Task Execution Stress Tests", () => {
     // Start a task that outputs 1MB with deliberate delay to allow tick measurement
     // The sleep ensures we have time to verify main thread remains responsive
     const id = await registry.spawn(
-      `sleep 0.1 && head -c ${OUTPUT_SIZE} /dev/zero | base64`
+      `sleep 0.1 && head -c ${OUTPUT_SIZE} /dev/zero | base64`,
     );
 
     // While that runs, we should be able to do other work
@@ -237,7 +243,8 @@ describe("Task Execution Stress Tests", () => {
     await registry.wait(id, 30000);
     clearInterval(tickInterval);
 
-    const task = registry.get(id)!;
+    const task = registry.get(id);
+    if (!task) throw new Error("Task not found");
     expect(task.status).toBe("completed");
 
     // Read stdout from file path to verify output captured
@@ -321,8 +328,8 @@ describe("Task Execution Stress Tests", () => {
 
     const ids = await Promise.all(
       Array.from({ length: QUEUED }, () =>
-        tinyRegistry.spawn("echo queued && sleep 0.05")
-      )
+        tinyRegistry.spawn("echo queued && sleep 0.05"),
+      ),
     );
 
     // Check queue state
@@ -331,9 +338,9 @@ describe("Task Execution Stress Tests", () => {
 
     // All should eventually complete
     const results = await Promise.all(ids.map((id) => tinyRegistry.wait(id)));
-    results.forEach((task) => {
+    for (const task of results) {
       expect(task.status).toBe("completed");
-    });
+    }
 
     tinyRegistry.clear();
   }, 30000);
@@ -345,7 +352,7 @@ describe("Task Execution Stress Tests", () => {
   test("captures incremental output correctly", async () => {
     // Command that outputs in chunks with delays
     const id = await registry.spawn(
-      'for i in 1 2 3; do echo "chunk $i"; sleep 0.1; done'
+      'for i in 1 2 3; do echo "chunk $i"; sleep 0.1; done',
     );
 
     const task = await registry.wait(id);
@@ -523,7 +530,7 @@ describe("Task Execution Benchmarks", () => {
     const start = Date.now();
 
     const ids = await Promise.all(
-      Array.from({ length: COUNT }, () => registry.spawn("echo bench"))
+      Array.from({ length: COUNT }, () => registry.spawn("echo bench")),
     );
     await Promise.all(ids.map((id) => registry.wait(id)));
 
