@@ -1,4 +1,5 @@
 import { appendFile } from "node:fs/promises";
+import type { PluginInput } from "@opencode-ai/plugin";
 import { type Plugin, tool } from "@opencode-ai/plugin";
 
 // ============================================================================
@@ -29,8 +30,9 @@ export class Semaphore {
   }
 
   release(): void {
-    // NOTE(victor): LOOP-4 fix - decrement acquired BEFORE awakening next waiter
-    // Otherwise acquired count becomes inconsistent during handoff
+    // NOTE(victor): Decrement acquired BEFORE resolving next waiter to keep activeCount accurate.
+    // If we resolve first, the awakened task increments acquired while we still hold our count,
+    // causing activeCount to briefly exceed maxConcurrent.
     this.acquired--;
     const next = this.waiting.shift();
     if (next) {
@@ -71,6 +73,7 @@ export type TaskStatus =
 
 export interface Task {
   id: string;
+  sessionID?: string; // For push notification on completion
   command: string;
   cwd: string;
   status: TaskStatus;
@@ -84,7 +87,8 @@ export interface Task {
   timeout?: number;
   abortController: AbortController;
   proc?: ReturnType<typeof Bun.spawn>;
-  // NOTE(victor): LOOP-3 fix - Promise-based completion instead of polling
+  // NOTE(victor): Promise-based completion allows wait() to block without polling.
+  // Polling at 10ms intervals wastes CPU cycles; awaiting a promise yields to the event loop.
   completionPromise: Promise<void>;
   resolveCompletion: () => void;
 }
@@ -94,6 +98,7 @@ export function createTask(
   command: string,
   cwd: string,
   timeout?: number,
+  sessionID?: string,
 ): Task {
   let resolveCompletion!: () => void;
   const completionPromise = new Promise<void>((r) => {
@@ -102,6 +107,7 @@ export function createTask(
 
   return {
     id,
+    sessionID,
     command,
     cwd,
     status: "pending",
@@ -123,6 +129,7 @@ export interface RegistryOptions {
   maxConcurrent?: number; // Default: 50
   taskTTL?: number; // Default: 30000ms
   maxOutputSize?: number; // Default: 5MB
+  client?: PluginInput["client"]; // For push notifications on task completion
 }
 
 export class TaskRegistry {
@@ -131,7 +138,8 @@ export class TaskRegistry {
   private nextId = 0;
   private evictionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private accepting = true;
-  private options: Required<RegistryOptions>;
+  private options: Required<Omit<RegistryOptions, "client">>;
+  private client?: PluginInput["client"];
 
   constructor(options: RegistryOptions = {}) {
     this.options = {
@@ -139,12 +147,13 @@ export class TaskRegistry {
       taskTTL: options.taskTTL ?? 30000,
       maxOutputSize: options.maxOutputSize ?? 5 * 1024 * 1024,
     };
+    this.client = options.client;
     this.semaphore = new Semaphore(this.options.maxConcurrent);
   }
 
   async spawn(
     command: string,
-    options: { timeout?: number; cwd?: string } = {},
+    options: { timeout?: number; cwd?: string; sessionID?: string } = {},
   ): Promise<string> {
     if (!this.accepting) {
       throw new Error("Registry is shutting down");
@@ -152,7 +161,13 @@ export class TaskRegistry {
 
     const id = `task-${this.nextId++}`;
     const cwd = options.cwd ?? process.cwd();
-    const task = createTask(id, command, cwd, options.timeout);
+    const task = createTask(
+      id,
+      command,
+      cwd,
+      options.timeout,
+      options.sessionID,
+    );
     this.tasks.set(id, task);
 
     // Execute in background - don't await
@@ -218,10 +233,31 @@ export class TaskRegistry {
       this.semaphore.release();
       task.resolveCompletion();
       this.scheduleEviction(task.id);
+      this.notifyCompletion(task);
     }
   }
 
-  // NOTE(victor): LOOP-1 fix - TTL-based eviction to prevent memory leak
+  // NOTE(victor): Push notification on completion eliminates polling.
+  // Model receives task ID and can fetch full output via TaskOutput if needed.
+  private notifyCompletion(task: Task): void {
+    if (!this.client || !task.sessionID) return;
+
+    this.client.session.promptAsync({
+      path: { id: task.sessionID },
+      body: {
+        parts: [
+          {
+            type: "text",
+            text: `<task-notification>\n<task-id>${task.id}</task-id>\n<status>${task.status}</status>\n<exit-code>${task.exitCode ?? "N/A"}</exit-code>\n<stdout-path>${task.stdout}</stdout-path>\n</task-notification>`,
+          },
+        ],
+      },
+    });
+  }
+
+  // NOTE(victor): TTL-based eviction prevents unbounded memory growth from completed tasks.
+  // Without eviction, long-running agents accumulate thousands of task records.
+  // 30s default aligns with Bun's GC slow-mode interval for efficient cleanup.
   private scheduleEviction(id: string): void {
     const existing = this.evictionTimers.get(id);
     if (existing) clearTimeout(existing);
@@ -243,7 +279,6 @@ export class TaskRegistry {
     return task;
   }
 
-  // NOTE(victor): LOOP-3 fix - Promise-based wait, zero CPU polling
   async wait(id: string, timeoutMs = 30000): Promise<Task> {
     const task = this.tasks.get(id);
     if (!task) throw new Error(`Task ${id} not found`);
@@ -295,7 +330,8 @@ export class TaskRegistry {
     return tasks.filter((t) => t.status === statusFilter);
   }
 
-  // NOTE(victor): LOOP-6 fix - Graceful shutdown with SIGTERM → wait → SIGKILL
+  // NOTE(victor): Graceful shutdown sends SIGTERM first, allowing processes to clean up
+  // (flush buffers, remove temp files). SIGKILL after grace period handles hung processes.
   async shutdown(gracePeriodMs = 3000): Promise<void> {
     this.accepting = false;
     this.semaphore.drain();
@@ -360,197 +396,90 @@ export class TaskRegistry {
 }
 
 // ============================================================================
-// Singleton Registry Instance
-// ============================================================================
-
-const registry = new TaskRegistry({ maxConcurrent: 50 });
-
-// ============================================================================
-// Tool Definitions
-// ============================================================================
-
-const BashTool = tool({
-  description:
-    "Execute command synchronously, blocks until completion. Returns stdout, stderr, exitCode.",
-  args: {
-    command: tool.schema.string().describe("Shell command to execute"),
-    cwd: tool.schema.string().optional().describe("Working directory"),
-    timeout: tool.schema
-      .number()
-      .optional()
-      .describe("Timeout in milliseconds"),
-  },
-  async execute(args) {
-    const id = await registry.spawn(args.command, {
-      cwd: args.cwd,
-      timeout: args.timeout,
-    });
-    const task = await registry.wait(id);
-
-    let stdout = "";
-    let stderr = "";
-    try {
-      stdout = await Bun.file(task.stdout).text();
-    } catch {}
-    try {
-      stderr = await Bun.file(task.stderr).text();
-    } catch {}
-
-    return JSON.stringify({
-      stdout,
-      stderr,
-      exitCode: task.exitCode,
-      status: task.status,
-    });
-  },
-});
-
-const TaskTool = tool({
-  description:
-    "Spawn background task, returns task ID immediately. Use TaskOutput/TaskWait to check results.",
-  args: {
-    command: tool.schema.string().describe("Shell command to execute"),
-    cwd: tool.schema.string().optional().describe("Working directory"),
-    timeout: tool.schema
-      .number()
-      .optional()
-      .describe("Timeout in milliseconds"),
-  },
-  async execute(args) {
-    const id = await registry.spawn(args.command, {
-      cwd: args.cwd,
-      timeout: args.timeout,
-    });
-    return JSON.stringify({ taskId: id, message: `Task ${id} spawned` });
-  },
-});
-
-const TaskOutputTool = tool({
-  description: "Get status and partial output of a background task",
-  args: {
-    taskId: tool.schema.string().describe("Task ID from Task"),
-  },
-  async execute(args) {
-    const task = registry.get(args.taskId);
-    if (!task)
-      return JSON.stringify({ error: `Task ${args.taskId} not found` });
-
-    const result: Record<string, unknown> = {
-      id: task.id,
-      status: task.status,
-      command: task.command,
-      createdAt: task.createdAt,
-    };
-
-    if (task.startedAt) result.startedAt = task.startedAt;
-    if (task.completedAt && task.startedAt) {
-      result.completedAt = task.completedAt;
-      result.duration = task.completedAt - task.startedAt;
-    }
-    if (task.exitCode !== undefined) result.exitCode = task.exitCode;
-    if (task.error) result.error = task.error;
-
-    // Read partial output if available (last 10KB)
-    if (task.status !== "pending") {
-      try {
-        const stdout = await Bun.file(task.stdout).text();
-        result.stdout = stdout.slice(-10000);
-      } catch {}
-    }
-
-    return JSON.stringify(result);
-  },
-});
-
-const TaskWaitTool = tool({
-  description: "Wait for background task to complete, returns full results",
-  args: {
-    taskId: tool.schema.string().describe("Task ID from Task"),
-    timeout: tool.schema
-      .number()
-      .optional()
-      .describe("Max wait time in ms (default 30s)"),
-  },
-  async execute(args) {
-    const task = await registry.wait(args.taskId, args.timeout ?? 30000);
-
-    let stdout = "";
-    let stderr = "";
-    try {
-      stdout = await Bun.file(task.stdout).text();
-    } catch {}
-    try {
-      stderr = await Bun.file(task.stderr).text();
-    } catch {}
-
-    return JSON.stringify({
-      id: task.id,
-      status: task.status,
-      exitCode: task.exitCode,
-      stdout,
-      stderr,
-      duration:
-        task.completedAt && task.startedAt
-          ? task.completedAt - task.startedAt
-          : 0,
-    });
-  },
-});
-
-const TaskStopTool = tool({
-  description: "Stop/cancel a running background task",
-  args: {
-    taskId: tool.schema.string().describe("Task ID to kill"),
-    signal: tool.schema
-      .enum(["SIGTERM", "SIGKILL"])
-      .optional()
-      .describe("Signal to send (default SIGTERM)"),
-  },
-  async execute(args) {
-    const stopped = registry.stop(args.taskId, args.signal);
-    return JSON.stringify({ success: stopped, taskId: args.taskId });
-  },
-});
-
-const TaskListTool = tool({
-  description: "List all background tasks with their status",
-  args: {
-    status: tool.schema
-      .enum(["all", "running", "completed", "failed", "pending", "cancelled"])
-      .optional()
-      .describe("Filter by status"),
-  },
-  async execute(args) {
-    const tasks = registry.list(args.status);
-    return JSON.stringify({
-      count: tasks.length,
-      tasks: tasks.map((t) => ({
-        id: t.id,
-        status: t.status,
-        command: t.command.slice(0, 100),
-        createdAt: t.createdAt,
-        duration:
-          t.completedAt && t.startedAt
-            ? t.completedAt - t.startedAt
-            : undefined,
-      })),
-    });
-  },
-});
-
-// ============================================================================
 // Plugin Export
 // ============================================================================
 
-export const CustomToolPlugin: Plugin = async () => {
+export const CustomToolPlugin: Plugin = async (input) => {
+  // NOTE(victor): Registry created per-plugin with client for push notifications.
+  // Tools access registry via closure.
+  const registry = new TaskRegistry({
+    maxConcurrent: 50,
+    client: input.client,
+  });
+
   return {
     tool: {
-      Bash: BashTool,
-      Task: TaskTool,
-      TaskOutput: TaskOutputTool,
-      TaskWait: TaskWaitTool,
-      TaskStop: TaskStopTool,
-      TaskList: TaskListTool,
+      Task: tool({
+        description:
+          "Spawn background task. You will receive a notification with stdout/stderr file paths when it completes. Use the Read tool to get output.",
+        args: {
+          command: tool.schema.string().describe("Shell command to execute"),
+          cwd: tool.schema.string().optional().describe("Working directory"),
+          timeout: tool.schema
+            .number()
+            .optional()
+            .describe("Timeout in milliseconds"),
+        },
+        async execute(args, context) {
+          const id = await registry.spawn(args.command, {
+            cwd: args.cwd,
+            timeout: args.timeout,
+            sessionID: context.sessionID,
+          });
+          return JSON.stringify({
+            taskId: id,
+            message: `Task ${id} spawned. You will receive a notification when complete.`,
+          });
+        },
+      }),
+
+      TaskStop: tool({
+        description: "Stop/cancel a running background task",
+        args: {
+          taskId: tool.schema.string().describe("Task ID to stop"),
+          signal: tool.schema
+            .enum(["SIGTERM", "SIGKILL"])
+            .optional()
+            .describe("Signal to send (default SIGTERM)"),
+        },
+        async execute(args) {
+          const stopped = registry.stop(args.taskId, args.signal);
+          return JSON.stringify({ success: stopped, taskId: args.taskId });
+        },
+      }),
+
+      TaskList: tool({
+        description: "List all background tasks with their status",
+        args: {
+          status: tool.schema
+            .enum([
+              "all",
+              "running",
+              "completed",
+              "failed",
+              "pending",
+              "cancelled",
+            ])
+            .optional()
+            .describe("Filter by status"),
+        },
+        async execute(args) {
+          const tasks = registry.list(args.status);
+          return JSON.stringify({
+            count: tasks.length,
+            tasks: tasks.map((t: Task) => ({
+              id: t.id,
+              status: t.status,
+              command: t.command.slice(0, 100),
+              createdAt: t.createdAt,
+              duration:
+                t.completedAt && t.startedAt
+                  ? t.completedAt - t.startedAt
+                  : undefined,
+            })),
+          });
+        },
+      }),
     },
   };
 };
