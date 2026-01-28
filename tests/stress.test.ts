@@ -16,7 +16,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readdirSync } from "node:fs";
-import { Semaphore, TaskRegistry } from "../index";
+import { Semaphore, TaskRegistry } from "../utils";
 
 // ============================================================================
 // Test Utilities (from Bun's harness.ts patterns)
