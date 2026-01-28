@@ -1,9 +1,21 @@
 {
   "name": "opencode-task",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
-  "main": "index.ts",
+  "main": "dist/index.js",
+  "files": ["dist"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cs50victor/opencode-task"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "build": "bun build index.ts --outdir dist --target node"
+  },
   "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
     "@opencode-ai/plugin": "latest",
     "typescript": "^5.0.0"
   }

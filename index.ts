@@ -1,4 +1,4 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { type Plugin, tool } from "@opencode-ai/plugin";
 
 export const CustomToolPlugin: Plugin = async () => {
   return {
@@ -9,9 +9,9 @@ export const CustomToolPlugin: Plugin = async () => {
           input: tool.schema.string().describe("Input to process"),
         },
         async execute(args) {
-          return `Processed: ${args.input}`
+          return `Processed: ${args.input}`;
         },
       }),
     },
-  }
-}
+  };
+};
