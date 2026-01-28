@@ -7,7 +7,8 @@ export type AgentType =
   | "Explore"
   | "Plan"
   | "general-purpose"
-  | "claude-code-guide";
+  | "claude-code-guide"
+  | "web-search";
 
 export interface AgentConfig {
   description: string;
@@ -65,6 +66,55 @@ export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
     prompt:
       "You are a Claude Code expert. Answer questions about Claude Code features, Agent SDK, and API usage accurately. Search documentation and web resources as needed.",
     tools: ["Glob", "Grep", "Read", "WebFetch", "WebSearch"],
+  },
+
+  "web-search": {
+    description:
+      "Web researcher for external information not in the codebase. Use for: library docs, API references, error lookups, technology research, best practices. Do NOT use for codebase questions (use Explore) or Claude Code questions (use claude-code-guide).",
+    prompt: `Research specialist. Find accurate information, cite sources, flag uncertainty.
+
+TOOLS:
+- WebSearch: Broad queries, discover sources
+- WebFetch: Extract content from specific URLs
+- Read/Grep/Glob: Check local files for context before searching
+- Bash: Use curl, gh, or CLI tools for direct API access
+- AskUserQuestion: Clarify ambiguous requests BEFORE searching
+
+PROCEDURE:
+1. Parse request: factual lookup | how-to | comparison | troubleshooting
+2. Search: Start specific, broaden if <3 relevant results
+3. Verify: Single authoritative source for facts. Cross-reference for disputed topics.
+4. Synthesize: Answer directly, then evidence.
+
+FAILURE HANDLING:
+- Limit to 5 source pages unless requested otherwise
+- If page inaccessible (paywall/JS-only), note and try alternatives
+- After 3 failed query reformulations, report partial findings and unknowns
+
+STOP CONDITIONS:
+- Factual: Official source found → done
+- How-to: Working solution with docs link → done
+- Troubleshooting: Root cause found OR 3 searches no progress → report gaps
+
+QUALITY:
+- Reject sources >2yr old for fast-moving topics
+- Priority: official docs > GitHub issues > Stack Overflow > blogs
+- On conflict, report both positions with provenance
+
+OUTPUT:
+[Direct answer or "Unable to determine"]
+[Evidence with inline [source](url) citations]
+[Confidence: HIGH (multiple authoritative) | MEDIUM (single authoritative) | LOW (conflicting/unofficial)]`,
+    tools: [
+      "WebSearch",
+      "WebFetch",
+      "Bash",
+      "Grep",
+      "Glob",
+      "Read",
+      "AskUserQuestion",
+    ],
+    model: "sonnet",
   },
 } as const;
 
@@ -528,10 +578,16 @@ export const CustomToolPlugin: Plugin = async (input) => {
 
       AgentTask: tool({
         description:
-          "Spawn a Claude agent to work on a subtask in the background. Available agents: Explore (codebase search), Plan (architecture design), general-purpose (complex multi-step tasks), claude-code-guide (Claude Code/SDK questions). You will receive a notification when complete.",
+          "Spawn a Claude agent to work on a subtask in the background. Available agents: Explore (codebase search), Plan (architecture design), general-purpose (complex multi-step tasks), claude-code-guide (Claude Code/SDK questions), web-search (research external information). You will receive a notification when complete.",
         args: {
           agent: tool.schema
-            .enum(["Explore", "Plan", "general-purpose", "claude-code-guide"])
+            .enum([
+              "Explore",
+              "Plan",
+              "general-purpose",
+              "claude-code-guide",
+              "web-search",
+            ])
             .describe("Agent type to spawn"),
           prompt: tool.schema.string().describe("Task prompt for the agent"),
           cwd: tool.schema.string().optional().describe("Working directory"),
