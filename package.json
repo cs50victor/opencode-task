@@ -1,0 +1,10 @@
+{
+  "name": "opencode-task",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.ts",
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "typescript": "^5.0.0"
+  }
+}
