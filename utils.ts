@@ -437,7 +437,7 @@ export class TaskRegistry {
         parts: [
           {
             type: "text",
-            text: `<task-notification>\n<task-id>${task.id}</task-id>\n<status>${task.status}</status>\n<exit-code>${task.exitCode ?? "N/A"}</exit-code>\n<stdout-path>${task.stdout}</stdout-path>\n</task-notification>`,
+            text: `<task-notification>\n<task-id>${task.id}</task-id>\n<status>${task.status}</status>\n<exit-code>${task.exitCode ?? "N/A"}</exit-code>\n<stdout-path>${task.stdout}</stdout-path>\n<stderr-path>${task.stderr}</stderr-path>\n</task-notification>`,
           },
         ],
       },
