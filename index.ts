@@ -12,8 +12,13 @@ export const CustomToolPlugin: Plugin = async (input) => {
   return {
     tool: {
       Task: tool({
-        description:
-          "Spawn background task. Returns stdout/stderr file paths immediately (readable while running). You will receive a notification when it completes.",
+        description: `Spawn background task.
+
+Returns:
+- taskId: unique identifier
+- stdout/stderr: file paths (LIVE - readable during execution, not just after)
+
+You will receive a notification when it completes.`,
         args: {
           command: tool.schema.string().describe("Shell command to execute"),
           cwd: tool.schema.string().optional().describe("Working directory"),
