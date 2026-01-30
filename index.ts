@@ -1,7 +1,7 @@
 import { type Plugin, tool } from "@opencode-ai/plugin";
 import { AGENT_CONFIGS, type Task, TaskRegistry } from "./utils";
 
-// type AgentType = keyof typeof AGENT_CONFIGS;
+type AgentType = keyof typeof AGENT_CONFIGS;
 
 export const CustomToolPlugin: Plugin = async (input) => {
   const registry = new TaskRegistry({
@@ -118,8 +118,6 @@ You will receive a notification when it completes.`,
         },
       }),
 
-      // NOTE(victor): AgentTask temporarily disabled -- re-enable when ready
-      /*
       AgentTask: tool({
         description:
           "Spawn a Claude agent to work on a subtask in the background. Available agents: Explore (codebase search), Plan (architecture design), general-purpose (complex multi-step tasks), claude-code-guide (Claude Code/SDK questions), web-search (research external information). You will receive a notification when complete.",
@@ -152,6 +150,11 @@ You will receive a notification when it completes.`,
 
           const cmdParts = [
             "claude",
+            "--verbose",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--allow-dangerously-skip-permissions",
             "--agents",
             JSON.stringify(agentDef),
             "--agent",
@@ -187,7 +190,6 @@ You will receive a notification when it completes.`,
           });
         },
       }),
-      */
     },
   };
 };
