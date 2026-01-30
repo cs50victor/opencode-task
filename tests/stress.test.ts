@@ -16,7 +16,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readdirSync } from "node:fs";
-import { Semaphore, TaskRegistry } from "../utils";
+import { Semaphore, TaskHistory, TaskRegistry } from "../utils";
 
 // ============================================================================
 // Test Utilities (from Bun's harness.ts patterns)
@@ -545,4 +545,267 @@ describe("Task Execution Benchmarks", () => {
 
     registry.clear();
   }, 60000);
+});
+
+// ============================================================================
+// TASK METADATA TESTS
+// ============================================================================
+
+describe("Task Metadata", () => {
+  test("should_store_and_return_metadata_when_spawned", async () => {
+    const registry = new TaskRegistry({ maxConcurrent: 5 });
+
+    const id = await registry.spawn("echo meta", {
+      metadata: { group: "ci", priority: "high" },
+    });
+    await registry.wait(id);
+
+    const task = registry.get(id);
+    expect(task).toBeDefined();
+    expect(task?.metadata).toEqual({ group: "ci", priority: "high" });
+
+    registry.clear();
+  }, 5000);
+
+  test("should_filter_tasks_by_metadata_key_value", async () => {
+    const registry = new TaskRegistry({ maxConcurrent: 5 });
+
+    await registry.spawn("echo a", { metadata: { group: "ci" } });
+    await registry.spawn("echo b", { metadata: { group: "build" } });
+    await registry.spawn("echo c", { metadata: { group: "ci", env: "prod" } });
+
+    // Wait for all to finish
+    const all = registry.list();
+    await Promise.all(all.map((t) => registry.wait(t.id)));
+
+    const ciTasks = registry.list(undefined, { group: "ci" });
+    expect(ciTasks.length).toBe(2);
+
+    const prodCi = registry.list(undefined, { group: "ci", env: "prod" });
+    expect(prodCi.length).toBe(1);
+
+    registry.clear();
+  }, 5000);
+
+  test("should_return_all_tasks_when_no_metadata_filter", async () => {
+    const registry = new TaskRegistry({ maxConcurrent: 5 });
+
+    await registry.spawn("echo a", { metadata: { group: "ci" } });
+    await registry.spawn("echo b");
+
+    const all = registry.list();
+    await Promise.all(all.map((t) => registry.wait(t.id)));
+
+    const unfiltered = registry.list();
+    expect(unfiltered.length).toBe(2);
+
+    registry.clear();
+  }, 5000);
+});
+
+// ============================================================================
+// PATH EXPOSURE TESTS
+// ============================================================================
+
+describe("Task Path Exposure", () => {
+  test("should_include_stdout_stderr_paths_on_task", async () => {
+    const registry = new TaskRegistry({ maxConcurrent: 5 });
+
+    const id = await registry.spawn("echo paths");
+    const task = registry.get(id);
+
+    expect(task).toBeDefined();
+    expect(task?.stdout).toMatch(/^\/tmp\//);
+    expect(task?.stderr).toMatch(/^\/tmp\//);
+
+    await registry.wait(id);
+    registry.clear();
+  }, 5000);
+
+  test("should_include_paths_in_list_output", async () => {
+    const registry = new TaskRegistry({ maxConcurrent: 5 });
+
+    await registry.spawn("echo list-paths");
+    const tasks = registry.list();
+
+    expect(tasks.length).toBe(1);
+    expect(tasks[0].stdout).toMatch(/^\/tmp\//);
+    expect(tasks[0].stderr).toMatch(/^\/tmp\//);
+
+    await registry.wait(tasks[0].id);
+    registry.clear();
+  }, 5000);
+});
+
+// ============================================================================
+// HISTORY RING BUFFER TESTS
+// ============================================================================
+
+describe("TaskHistory Ring Buffer", () => {
+  test("should_archive_evicted_tasks_to_history", async () => {
+    const registry = new TaskRegistry({
+      maxConcurrent: 5,
+      taskTTL: 50,
+      maxHistory: 100,
+    });
+
+    const id = await registry.spawn("echo archived", {
+      metadata: { group: "test" },
+    });
+    await registry.wait(id);
+
+    // Wait for eviction
+    await Bun.sleep(100);
+
+    // Task gone from main map
+    expect(registry.get(id)).toBeUndefined();
+
+    // But present in history
+    const history = registry.history();
+    expect(history.length).toBe(1);
+    expect(history[0].id).toBe(id);
+    expect(history[0].status).toBe("completed");
+    expect(history[0].metadata).toEqual({ group: "test" });
+    expect(history[0].stdout).toMatch(/^\/tmp\//);
+
+    registry.clear();
+  }, 5000);
+
+  test("should_respect_max_history_size", async () => {
+    const maxHistory = 3;
+    const registry = new TaskRegistry({
+      maxConcurrent: 5,
+      taskTTL: 50,
+      maxHistory,
+    });
+
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      ids.push(await registry.spawn(`echo overflow-${i}`));
+    }
+    await Promise.all(ids.map((id) => registry.wait(id)));
+
+    // Wait for eviction
+    await Bun.sleep(100);
+
+    const history = registry.history();
+    expect(history.length).toBe(maxHistory);
+
+    // Oldest entries should be dropped (ids[0], ids[1] gone)
+    const historyIds = history.map((h) => h.id);
+    expect(historyIds).not.toContain(ids[0]);
+    expect(historyIds).not.toContain(ids[1]);
+    expect(historyIds).toContain(ids[4]);
+
+    registry.clear();
+  }, 5000);
+
+  test("should_filter_history_by_status", async () => {
+    const registry = new TaskRegistry({
+      maxConcurrent: 5,
+      taskTTL: 50,
+      maxHistory: 100,
+    });
+
+    await registry.spawn("echo ok");
+    await registry.spawn("exit 1");
+    const all = registry.list();
+    await Promise.all(all.map((t) => registry.wait(t.id)));
+
+    await Bun.sleep(100);
+
+    const completed = registry.history("completed");
+    const failed = registry.history("failed");
+
+    expect(completed.length).toBe(1);
+    expect(failed.length).toBe(1);
+
+    registry.clear();
+  }, 5000);
+
+  test("should_filter_history_by_metadata", async () => {
+    const registry = new TaskRegistry({
+      maxConcurrent: 5,
+      taskTTL: 50,
+      maxHistory: 100,
+    });
+
+    await registry.spawn("echo a", { metadata: { group: "ci" } });
+    await registry.spawn("echo b", { metadata: { group: "build" } });
+    const all = registry.list();
+    await Promise.all(all.map((t) => registry.wait(t.id)));
+
+    await Bun.sleep(100);
+
+    const ciHistory = registry.history(undefined, { group: "ci" });
+    expect(ciHistory.length).toBe(1);
+    expect(ciHistory[0].metadata).toEqual({ group: "ci" });
+
+    registry.clear();
+  }, 5000);
+
+  test("should_not_include_history_by_default_in_list", async () => {
+    const registry = new TaskRegistry({
+      maxConcurrent: 5,
+      taskTTL: 50,
+      maxHistory: 100,
+    });
+
+    const id = await registry.spawn("echo gone");
+    await registry.wait(id);
+    await Bun.sleep(100);
+
+    // Evicted from main map
+    const liveTasks = registry.list();
+    expect(liveTasks.length).toBe(0);
+
+    // But history has it
+    expect(registry.history().length).toBe(1);
+
+    registry.clear();
+  }, 5000);
+});
+
+// ============================================================================
+// TaskHistory Unit Tests
+// ============================================================================
+
+describe("TaskHistory", () => {
+  test("circular buffer overwrites oldest entries", () => {
+    const buf = new TaskHistory(3);
+
+    for (let i = 0; i < 5; i++) {
+      buf.push({
+        id: `task-${i}`,
+        command: `echo ${i}`,
+        status: "completed",
+        stdout: `/tmp/task-${i}-stdout`,
+        stderr: `/tmp/task-${i}-stderr`,
+        createdAt: Date.now(),
+      });
+    }
+
+    const entries = buf.entries();
+    expect(entries.length).toBe(3);
+    expect(entries[0].id).toBe("task-2");
+    expect(entries[1].id).toBe("task-3");
+    expect(entries[2].id).toBe("task-4");
+  });
+
+  test("entries returns copy not reference", () => {
+    const buf = new TaskHistory(5);
+    buf.push({
+      id: "task-0",
+      command: "echo test",
+      status: "completed",
+      stdout: "/tmp/task-0-stdout",
+      stderr: "/tmp/task-0-stderr",
+      createdAt: Date.now(),
+    });
+
+    const a = buf.entries();
+    const b = buf.entries();
+    expect(a).not.toBe(b);
+    expect(a).toEqual(b);
+  });
 });

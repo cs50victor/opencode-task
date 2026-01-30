@@ -180,14 +180,15 @@ export type TaskStatus =
 
 export interface Task {
   id: string;
-  sessionID?: string; // For push notification on completion
+  sessionID?: string;
   command: string;
   cwd: string;
   status: TaskStatus;
-  stdout: string; // File path (not content)
-  stderr: string; // File path (not content)
+  stdout: string;
+  stderr: string;
   exitCode?: number;
   error?: string;
+  metadata?: Record<string, string>;
   createdAt: number;
   startedAt?: number;
   completedAt?: number;
@@ -206,6 +207,7 @@ export function createTask(
   cwd: string,
   timeout?: number,
   sessionID?: string,
+  metadata?: Record<string, string>,
 ): Task {
   let resolveCompletion!: () => void;
   const completionPromise = new Promise<void>((r) => {
@@ -220,12 +222,86 @@ export function createTask(
     status: "pending",
     stdout: `/tmp/${id}-stdout`,
     stderr: `/tmp/${id}-stderr`,
+    metadata,
     createdAt: Date.now(),
     timeout,
     abortController: new AbortController(),
     completionPromise,
     resolveCompletion,
   };
+}
+
+function matchMetadata(
+  taskMeta: Record<string, string> | undefined,
+  filter: Record<string, string>,
+): boolean {
+  if (!taskMeta) return false;
+  for (const [key, value] of Object.entries(filter)) {
+    if (taskMeta[key] !== value) return false;
+  }
+  return true;
+}
+
+// ============================================================================
+// TaskHistory - Fixed-size circular buffer for evicted tasks
+// ============================================================================
+
+export interface TaskHistoryEntry {
+  id: string;
+  command: string;
+  status: TaskStatus;
+  exitCode?: number;
+  metadata?: Record<string, string>;
+  stdout: string;
+  stderr: string;
+  createdAt: number;
+  startedAt?: number;
+  completedAt?: number;
+}
+
+export class TaskHistory {
+  private buffer: (TaskHistoryEntry | undefined)[];
+  private head = 0;
+  private count = 0;
+
+  constructor(public readonly capacity: number) {
+    this.buffer = new Array(capacity);
+  }
+
+  push(entry: TaskHistoryEntry): void {
+    this.buffer[this.head] = entry;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.count < this.capacity) this.count++;
+  }
+
+  entries(
+    statusFilter?: string,
+    metadataFilter?: Record<string, string>,
+  ): TaskHistoryEntry[] {
+    const result: TaskHistoryEntry[] = [];
+    const start = this.count < this.capacity ? 0 : this.head;
+
+    for (let i = 0; i < this.count; i++) {
+      const idx = (start + i) % this.capacity;
+      const entry = this.buffer[idx];
+      if (!entry) continue;
+      if (statusFilter && entry.status !== statusFilter) continue;
+      if (metadataFilter && !matchMetadata(entry.metadata, metadataFilter))
+        continue;
+      result.push({ ...entry });
+    }
+    return result;
+  }
+
+  get length(): number {
+    return this.count;
+  }
+
+  clear(): void {
+    this.buffer = new Array(this.capacity);
+    this.head = 0;
+    this.count = 0;
+  }
 }
 
 // ============================================================================
@@ -236,7 +312,8 @@ export interface RegistryOptions {
   maxConcurrent?: number; // Default: 50
   taskTTL?: number; // Default: 30000ms
   maxOutputSize?: number; // Default: 5MB
-  client?: PluginInput["client"]; // For push notifications on task completion
+  maxHistory?: number; // Default: 200
+  client?: PluginInput["client"];
 }
 
 export class TaskRegistry {
@@ -247,20 +324,28 @@ export class TaskRegistry {
   private accepting = true;
   private options: Required<Omit<RegistryOptions, "client">>;
   private client?: PluginInput["client"];
+  private taskHistory: TaskHistory;
 
   constructor(options: RegistryOptions = {}) {
     this.options = {
       maxConcurrent: options.maxConcurrent ?? 50,
       taskTTL: options.taskTTL ?? 30000,
       maxOutputSize: options.maxOutputSize ?? 5 * 1024 * 1024,
+      maxHistory: options.maxHistory ?? 200,
     };
     this.client = options.client;
     this.semaphore = new Semaphore(this.options.maxConcurrent);
+    this.taskHistory = new TaskHistory(this.options.maxHistory);
   }
 
   async spawn(
     command: string,
-    options: { timeout?: number; cwd?: string; sessionID?: string } = {},
+    options: {
+      timeout?: number;
+      cwd?: string;
+      sessionID?: string;
+      metadata?: Record<string, string>;
+    } = {},
   ): Promise<string> {
     if (!this.accepting) {
       throw new Error("Registry is shutting down");
@@ -274,6 +359,7 @@ export class TaskRegistry {
       cwd,
       options.timeout,
       options.sessionID,
+      options.metadata,
     );
     this.tasks.set(id, task);
     this.executeTask(task);
@@ -366,6 +452,21 @@ export class TaskRegistry {
     if (existing) clearTimeout(existing);
 
     const timer = setTimeout(() => {
+      const task = this.tasks.get(id);
+      if (task) {
+        this.taskHistory.push({
+          id: task.id,
+          command: task.command.slice(0, 200),
+          status: task.status,
+          exitCode: task.exitCode,
+          metadata: task.metadata,
+          stdout: task.stdout,
+          stderr: task.stderr,
+          createdAt: task.createdAt,
+          startedAt: task.startedAt,
+          completedAt: task.completedAt,
+        });
+      }
       this.tasks.delete(id);
       this.evictionTimers.delete(id);
     }, this.options.taskTTL);
@@ -425,12 +526,15 @@ export class TaskRegistry {
     return false;
   }
 
-  list(statusFilter?: string): Task[] {
-    const tasks = Array.from(this.tasks.values());
-    if (!statusFilter || statusFilter === "all") {
-      return tasks;
+  list(statusFilter?: string, metadataFilter?: Record<string, string>): Task[] {
+    let tasks = Array.from(this.tasks.values());
+    if (statusFilter && statusFilter !== "all") {
+      tasks = tasks.filter((t) => t.status === statusFilter);
     }
-    return tasks.filter((t) => t.status === statusFilter);
+    if (metadataFilter) {
+      tasks = tasks.filter((t) => matchMetadata(t.metadata, metadataFilter));
+    }
+    return tasks;
   }
 
   // NOTE(victor): Graceful shutdown sends SIGTERM first, allowing processes to clean up
@@ -484,11 +588,19 @@ export class TaskRegistry {
     return this.semaphore.waitingCount;
   }
 
+  history(
+    statusFilter?: string,
+    metadataFilter?: Record<string, string>,
+  ): TaskHistoryEntry[] {
+    return this.taskHistory.entries(statusFilter, metadataFilter);
+  }
+
   clear(): void {
     for (const timer of this.evictionTimers.values()) {
       clearTimeout(timer);
     }
     this.evictionTimers.clear();
     this.tasks.clear();
+    this.taskHistory.clear();
   }
 }

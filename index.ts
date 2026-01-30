@@ -13,7 +13,7 @@ export const CustomToolPlugin: Plugin = async (input) => {
     tool: {
       Task: tool({
         description:
-          "Spawn background task. You will receive a notification with stdout/stderr file paths when it completes. Use the Read tool to get output.",
+          "Spawn background task. Returns stdout/stderr file paths immediately (readable while running). You will receive a notification when it completes.",
         args: {
           command: tool.schema.string().describe("Shell command to execute"),
           cwd: tool.schema.string().optional().describe("Working directory"),
@@ -21,15 +21,23 @@ export const CustomToolPlugin: Plugin = async (input) => {
             .number()
             .optional()
             .describe("Timeout in milliseconds"),
+          metadata: tool.schema
+            .record(tool.schema.string(), tool.schema.string())
+            .optional()
+            .describe("Key-value metadata tags for filtering"),
         },
         async execute(args, context) {
           const id = await registry.spawn(args.command, {
             cwd: args.cwd,
             timeout: args.timeout,
             sessionID: context.sessionID,
+            metadata: args.metadata,
           });
+          const task = registry.get(id);
           return JSON.stringify({
             taskId: id,
+            stdout: task?.stdout,
+            stderr: task?.stderr,
             message: `Task ${id} spawned. You will receive a notification when complete.`,
           });
         },
@@ -51,7 +59,8 @@ export const CustomToolPlugin: Plugin = async (input) => {
       }),
 
       TaskList: tool({
-        description: "List all background tasks with their status",
+        description:
+          "List background tasks with status, output paths, and metadata. Supports filtering by status and metadata. Use includeHistory to see evicted tasks.",
         args: {
           status: tool.schema
             .enum([
@@ -64,22 +73,43 @@ export const CustomToolPlugin: Plugin = async (input) => {
             ])
             .optional()
             .describe("Filter by status"),
+          metadata: tool.schema
+            .record(tool.schema.string(), tool.schema.string())
+            .optional()
+            .describe("Filter by metadata key-value pairs (all must match)"),
+          includeHistory: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "Include evicted tasks from history buffer (default false)",
+            ),
         },
         async execute(args) {
-          const tasks = registry.list(args.status);
-          return JSON.stringify({
+          const tasks = registry.list(args.status, args.metadata);
+          const result: Record<string, unknown> = {
             count: tasks.length,
             tasks: tasks.map((t: Task) => ({
               id: t.id,
               status: t.status,
               command: t.command.slice(0, 100),
+              stdout: t.stdout,
+              stderr: t.stderr,
+              metadata: t.metadata,
               createdAt: t.createdAt,
               duration:
                 t.completedAt && t.startedAt
                   ? t.completedAt - t.startedAt
                   : undefined,
             })),
-          });
+          };
+
+          if (args.includeHistory) {
+            const history = registry.history(args.status, args.metadata);
+            result.history = history;
+            result.historyCount = history.length;
+          }
+
+          return JSON.stringify(result);
         },
       }),
 
