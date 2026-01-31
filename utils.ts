@@ -351,7 +351,7 @@ export class TaskRegistry {
       throw new Error("Registry is shutting down");
     }
 
-    const id = `task-${this.nextId++}`;
+    const id = `task-${this.nextId++}-${crypto.randomUUID()}`;
     const cwd = options.cwd ?? process.cwd();
     const task = createTask(
       id,
