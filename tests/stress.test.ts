@@ -674,7 +674,7 @@ describe("TaskHistory Ring Buffer", () => {
   test("should_respect_max_history_size", async () => {
     const maxHistory = 3;
     const registry = new TaskRegistry({
-      maxConcurrent: 5,
+      maxConcurrent: 1, // Sequential execution to guarantee FIFO eviction order
       taskTTL: 50,
       maxHistory,
     });
